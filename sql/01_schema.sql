@@ -1,3 +1,9 @@
+-- =============================================================================
+-- EXPRESSYA — ESQUEMA FÍSICO RELACIONAL ACID (sql/01_schema.sql)
+-- Garantiza INV-01 (no negatividad), INV-02 (C + R <= E), INV-04/10 (estados terminales),
+-- INV-05 (un compromiso por reserva y deduplicación de webhook) e INV-09 (bitácora inmutable).
+-- =============================================================================
+
 CREATE TABLE IF NOT EXISTS dark_store (
     dark_store_id    TEXT PRIMARY KEY,
     codigo_tienda    TEXT NOT NULL UNIQUE,
@@ -171,6 +177,37 @@ CREATE TABLE IF NOT EXISTS evento_outbox (
     intentos        INTEGER NOT NULL DEFAULT 0,
     creado_epoch    REAL NOT NULL,
     publicado_epoch REAL
+);
+
+CREATE TABLE IF NOT EXISTS evento_consumido (
+    evento_id         TEXT NOT NULL,
+    modulo_consumidor TEXT NOT NULL,
+    tipo_evento       TEXT NOT NULL,
+    procesado_epoch   REAL NOT NULL,
+    PRIMARY KEY (evento_id, modulo_consumidor)
+);
+
+
+-- =============================================================================
+-- HITO C3 (AT-07 y S2-03): Registro auditable de discrepancias físico-lógicas
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS incidencia_inventario (
+    incidencia_id        TEXT PRIMARY KEY,
+    inventario_id        TEXT NOT NULL REFERENCES inventario_tienda(inventario_id),
+    dark_store_id        TEXT NOT NULL,
+    sku_id               TEXT NOT NULL,
+    reportado_por        TEXT NOT NULL,
+    existencia_logica    INTEGER NOT NULL,
+    conteo_fisico        INTEGER NOT NULL,
+    diferencia           INTEGER NOT NULL,
+    estado_incidencia    TEXT NOT NULL DEFAULT 'PENDIENTE_VERIFICACION_SUPERVISOR'
+        CHECK (estado_incidencia IN (
+            'PENDIENTE_VERIFICACION_SUPERVISOR',
+            'RESUELTA_AJUSTE_APROBADO',
+            'RECHAZADA_CONTEO_CORRECTO'
+        )),
+    motivo_detalle       TEXT NOT NULL,
+    registrada_epoch     REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS evento_consumido (
