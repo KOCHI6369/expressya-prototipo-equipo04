@@ -1,0 +1,399 @@
+import uuid
+from app.database import DomainHttpError, atomic_transaction, get_connection
+from app.services import _now
+def registrar_discrepancia_picking(
+ dark_store_id: str,
+ sku_id: str,
+ conteo_fisico: int,
+ picker_id: str = "PICKER-01",
+ motivo: str = "Conteo físico en anaquel menor a existencia lógica (AT-07)",
+) -> dict:
+ """
+ Hito C3 (AT-07 y S2-03):
+ Simula discrepancia (ej. sistema=10, físico=8), registra la incidencia
+auditable,
+ bloquea de inmediato la disponibilidad incierta (estado_sku = 'INHABILITADO')
+ y registra el movimiento FALTANTE_PICKING sin cancelar a ciegas pedidos
+pagados.
+ """
+ if conteo_fisico < 0:
+ raise DomainHttpError(400, "CONTEO_INVALIDO", "El conteo físico no puede
+ser negativo.")
+ with atomic_transaction() as conn:
+ now = _now(0.0)
+ inv = conn.execute(
+ "SELECT * FROM inventario_tienda WHERE dark_store_id = ? AND sku_id =
+?",
+ (dark_store_id, sku_id),
+ ).fetchone()
+ if not inv:
+ raise DomainHttpError(404, "SKU_NO_EXISTE", f"SKU {sku_id} no existe
+en {dark_store_id}")
+ existencia_logica = inv["existencia_e"]
+ diferencia = conteo_fisico - existencia_logica
+ unidades_inciertas = max(0, existencia_logica - conteo_fisico)
+ incidencia_id = f"INC-{uuid.uuid4().hex[:8].upper()}"
+ # Bloquear disponibilidad incierta de inmediato (AT-07 / S2-03)
+ conn.execute(
+ """
+ UPDATE inventario_tienda
+ SET estado_sku = 'INHABILITADO',
+ oculto_h = ?,
+ version_concurrency = version_concurrency + 1
+ WHERE inventario_id = ?
+ """,
+ (unidades_inciertas, inv["inventario_id"]),
+ )
+ conn.execute(
+ """
+ INSERT INTO incidencia_inventario
+ (incidencia_id, inventario_id, dark_store_id, sku_id,
+reportado_por,
+ existencia_logica, conteo_fisico, diferencia, estado_incidencia,
+ motivo_detalle, registrada_epoch)
+ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE_VERIFICACION_SUPERVISOR',
+?, ?)
+ """,
+ (
+ incidencia_id, inv["inventario_id"], dark_store_id, sku_id,
+picker_id,
+ existencia_logica, conteo_fisico, diferencia, motivo, now,
+ ),
+ )
+ delta_h = unidades_inciertas - inv["oculto_h"]
+ conn.execute(
+ """
+ INSERT INTO movimiento_inventario
+ (movimiento_id, inventario_id, usuario_id, tipo_movimiento,
+ delta_e, delta_r, delta_c, delta_h, correlation_id,
+ motivo_detalle, registrado_epoch)
+ VALUES (?, ?, ?, 'FALTANTE_PICKING', 0, 0, 0, ?, ?, ?, ?)
+ """,
+ (
+ str(uuid.uuid4()), inv["inventario_id"], picker_id, delta_h,
+ incidencia_id,
+ f"Discrepancia lógica={existencia_logica} vs
+física={conteo_fisico}. SKU INHABILITADO.",
+ now,
+ ),
+ )
+ return {
+ "incidencia_id": incidencia_id,
+ "dark_store_id": dark_store_id,
+ "sku_id": sku_id,
+ "existencia_logica": existencia_logica,
+ "conteo_fisico": conteo_fisico,
+ "diferencia": diferencia,
+ "estado_sku_nuevo": "INHABILITADO",
+ "estado_incidencia": "PENDIENTE_VERIFICACION_SUPERVISOR",
+ "disponible_para_venta": 0,
+ "mensaje": "AT-07: Incidencia registrada y disponibilidad incierta
+bloqueada de inmediato.",
+ }
+def _insertar_reembolso_parcial_conn(
+ conn,
+ pedido_id: str,
+ sku_id: str,
+ monto: float,
+ motivo: str,
+ eval_epoch: float,
+) -> tuple[bool, dict]:
+ """Helper transaccional idempotente para AT-09."""
+ scope_key = f"LINEA:{sku_id}"
+ idem_key = f"REF-PARCIAL-{pedido_id}-{sku_id}"
+ reembolso_id = f"RMB-{uuid.uuid4().hex[:8].upper()}"
+ cur = conn.execute(
+ """
+ INSERT OR IGNORE INTO obligacion_reembolso
+ (reembolso_id, pedido_id, linea_scope_key, monto_a_reembolsar,
+ motivo_reembolso, estado_reembolso, idempotency_key_reembolso,
+creado_epoch)
+ VALUES (?, ?, ?, ?, ?, 'COMPLETADO', ?, ?)
+ """,
+ (reembolso_id, pedido_id, scope_key, round(monto, 2), motivo, idem_key,
+eval_epoch),
+ )
+ if cur.rowcount == 1:
+ conn.execute(
+ """
+ UPDATE pedido
+ SET monto_reembolso_obligado = ROUND(monto_reembolso_obligado + ?,
+2),
+ monto_reembolso_confirmado = ROUND(monto_reembolso_confirmado +
+?, 2)
+ WHERE pedido_id = ?
+ """,
+ (round(monto, 2), round(monto, 2), pedido_id),
+ )
+ duplicado = False
+ else:
+ duplicado = True
+ fila = conn.execute(
+ "SELECT * FROM obligacion_reembolso WHERE pedido_id = ? AND
+linea_scope_key = ? AND motivo_reembolso = ?",
+ (pedido_id, scope_key, motivo),
+ ).fetchone()
+ return duplicado, dict(fila)
+def procesar_surtido_parcial(
+ pedido_id: str,
+ skus_faltantes: list[str],
+ picker_id: str = "PICKER-01",
+ motivo_faltante: str = "FALTANTE_FISICO_EN_PICKING",
+) -> dict:
+ """
+ Hito C3 (AT-08 y AT-09):
+ Procesa un pedido pagado de N líneas (ej. 5 líneas) donde una o más no son
+surtibles:
+ - Las líneas surtibles pasan a SURTIDA (SALIDA_PICKING: baja E y C).
+ - La línea faltante pasa a CANCELADA_FALTANTE (RECORTE_COMPROMISO: baja C).
+ - El pedido continúa como SURTIDO_PARCIAL y genera el reembolso parcial
+idempotente.
+ """
+ faltantes_set = set(skus_faltantes or [])
+ with atomic_transaction() as conn:
+ now = _now(0.0)
+ ped = conn.execute("SELECT * FROM pedido WHERE pedido_id = ?",
+(pedido_id,)).fetchone()
+ if not ped:
+ raise DomainHttpError(404, "PEDIDO_NO_EXISTE", "Pedido no
+encontrado.")
+ if ped["estado_pedido"] not in ("PAGADO", "EN_PICKING"):
+ raise DomainHttpError(
+ 409,
+ "ESTADO_PEDIDO_INVALIDO",
+ f"El pedido debe estar en PAGADO para surtirse (actual:
+{ped['estado_pedido']}).",
+ )
+ lineas = conn.execute(
+ "SELECT * FROM linea_pedido WHERE pedido_id = ? ORDER BY sku_id ASC",
+ (pedido_id,),
+ ).fetchall()
+ surtidas = []
+ canceladas = []
+ reembolsos = []
+ subtotal_surtido = 0.0
+ for lin in lineas:
+ sku = lin["sku_id"]
+ cant = lin["cantidad_solicitada"]
+ precio = lin["precio_unitario_congelado"]
+ inv = conn.execute(
+ "SELECT inventario_id FROM inventario_tienda WHERE dark_store_id =
+? AND sku_id = ?",
+ (ped["dark_store_id"], sku),
+ ).fetchone()
+ if sku in faltantes_set:
+ # Línea no surtible: cancelar parcialmente y reembolsar
+ conn.execute(
+ """
+UPDATE linea_pedido
+ SET cantidad_surtida = 0, cantidad_cancelada = ?,
+ estado_linea = 'CANCELADA_FALTANTE',
+motivo_cancelacion_linea = ?
+ WHERE linea_pedido_id = ?
+ """,
+(cant, motivo_faltante, lin["linea_pedido_id"]),
+ )
+ conn.execute(
+ """
+UPDATE inventario_tienda
+ SET comprometido_c = comprometido_c - ?,
+ version_concurrency = version_concurrency + 1
+ WHERE inventario_id = ?
+ """,
+(cant, inv["inventario_id"]),
+ )
+ conn.execute(
+ """
+INSERT INTO movimiento_inventario
+ (movimiento_id, inventario_id, usuario_id,
+tipo_movimiento,
+ delta_e, delta_r, delta_c, delta_h, pedido_id,
+correlation_id,
+ motivo_detalle, registrado_epoch)
+ VALUES (?, ?, ?, 'RECORTE_COMPROMISO', 0, 0, ?, 0, ?, ?, ?, ?)
+ """,
+(
+ str(uuid.uuid4()), inv["inventario_id"], picker_id, -cant,
+ pedido_id, ped["correlation_id"],
+ f"Cancelación parcial línea {sku} por {motivo_faltante}
+(AT-08)", now,
+ ),
+ )
+ monto_linea = round(cant * precio, 2)
+ dup, remb = _insertar_reembolso_parcial_conn(
+ conn, pedido_id, sku, monto_linea, motivo_faltante, now
+ )
+ canceladas.append({"sku_id": sku, "cantidad_cancelada": cant,
+"monto_reembolsado": monto_linea})
+ reembolsos.append({"duplicado_ignorado": dup, **remb})
+ else:
+ # Línea surtible: continúa normalmente
+ conn.execute(
+ """
+UPDATE linea_pedido
+ SET cantidad_surtida = ?, cantidad_cancelada = 0,
+estado_linea = 'SURTIDA'
+ WHERE linea_pedido_id = ?
+ """,
+(cant, lin["linea_pedido_id"]),
+ )
+ conn.execute(
+ """
+UPDATE inventario_tienda
+ SET existencia_e = existencia_e - ?,
+ comprometido_c = comprometido_c - ?,
+ version_concurrency = version_concurrency + 1
+ WHERE inventario_id = ?
+ """,
+(cant, cant, inv["inventario_id"]),
+ )
+ conn.execute(
+ """
+INSERT INTO movimiento_inventario
+ (movimiento_id, inventario_id, usuario_id,
+tipo_movimiento,
+ delta_e, delta_r, delta_c, delta_h, pedido_id,
+correlation_id,
+ motivo_detalle, registrado_epoch)
+ VALUES (?, ?, ?, 'SALIDA_PICKING', ?, 0, ?, 0, ?, ?, ?, ?)
+ """,
+(
+ str(uuid.uuid4()), inv["inventario_id"], picker_id, -cant,
+-cant,
+ pedido_id, ped["correlation_id"],
+ f"Surtido físico confirmado de {sku} (AT-08)", now,
+ ),
+ )
+ subtotal_surtido = round(subtotal_surtido + (cant * precio), 2)
+ surtidas.append({"sku_id": sku, "cantidad_surtida": cant})
+ if len(canceladas) == 0:
+ nuevo_estado = "SURTIDO_COMPLETO"
+ elif len(surtidas) > 0:
+ nuevo_estado = "SURTIDO_PARCIAL"
+ else:
+ nuevo_estado = "CANCELADO_TOTAL"
+ conn.execute(
+ """
+ UPDATE pedido
+ SET estado_pedido = ?, subtotal_mercancia_surtida = ?
+ WHERE pedido_id = ?
+ """,
+ (nuevo_estado, subtotal_surtido, pedido_id),
+ )
+ ped_actualizado = dict(conn.execute("SELECT * FROM pedido WHERE pedido_id
+= ?", (pedido_id,)).fetchone())
+ return {
+ "pedido_id": pedido_id,
+ "estado_pedido": nuevo_estado,
+ "total_lineas_surtidas": len(surtidas),
+ "total_lineas_canceladas": len(canceladas),
+ "lineas_surtidas": surtidas,
+ "lineas_canceladas": canceladas,
+ "subtotal_mercancia_surtida": subtotal_surtido,
+ "monto_reembolso_confirmado":
+ped_actualizado["monto_reembolso_confirmado"],
+ "reembolsos_generados": reembolsos,
+ }
+def registrar_reembolso_parcial_idempotente(
+ pedido_id: str,
+ sku_id: str,
+ monto: float,
+ motivo: str = "FALTANTE_FISICO_EN_PICKING",
+) -> dict:
+ """
+ Hito C3 (AT-09):
+ Permite disparar o reintentar un reembolso parcial por línea garantizando que
+el efecto
+ económico se aplique exactamente una vez aunque la solicitud llegue repetida.
+ """
+ if monto <= 0:
+ raise DomainHttpError(400, "MONTO_INVALIDO", "El monto a reembolsar debe
+ser mayor a 0.")
+ with atomic_transaction() as conn:
+ now = _now(0.0)
+ ped = conn.execute("SELECT * FROM pedido WHERE pedido_id = ?",
+(pedido_id,)).fetchone()
+ if not ped:
+ raise DomainHttpError(404, "PEDIDO_NO_EXISTE", "Pedido no
+encontrado.")
+ duplicado, remb = _insertar_reembolso_parcial_conn(conn, pedido_id,
+sku_id, monto, motivo, now)
+ ped_final = conn.execute("SELECT * FROM pedido WHERE pedido_id = ?",
+(pedido_id,)).fetchone()
+ return {
+ "pedido_id": pedido_id,
+ "sku_id": sku_id,
+ "reembolso_duplicado_ignorado": duplicado,
+ "monto_reembolso_confirmado_en_pedido":
+ped_final["monto_reembolso_confirmado"],
+ "reembolso": remb,
+ "mensaje": (
+ "AT-09: Reembolso parcial repetido ignorado sin duplicar efecto
+económico."
+ if duplicado
+ else "AT-09: Reembolso parcial aplicado por primera y única vez."
+ ),
+ }
+def consultar_historial_auditoria(
+ dark_store_id: str | None = None,
+ sku_id: str | None = None,
+ pedido_id: str | None = None,
+) -> dict:
+ """
+ Hito C3 Punto 4:
+ Responde quién/qué cambió el inventario, cuándo, por qué y cómo impactó al
+pedido.
+ """
+ conn = get_connection()
+ try:
+ filtros = []
+ params = []
+ if dark_store_id:
+ filtros.append("it.dark_store_id = ?")
+ params.append(dark_store_id)
+ if sku_id:
+ filtros.append("it.sku_id = ?")
+ params.append(sku_id)
+ if pedido_id:
+ filtros.append("m.pedido_id = ?")
+ params.append(pedido_id)
+ where_sql = ("WHERE " + " AND ".join(filtros)) if filtros else ""
+ movimientos = conn.execute(
+ f"""
+ SELECT m.movimiento_id, it.dark_store_id, it.sku_id,
+ m.usuario_id AS quien, m.tipo_movimiento AS que_cambio,
+ m.registrado_epoch AS cuando_epoch, m.motivo_detalle AS porque,
+ m.delta_e, m.delta_r, m.delta_c, m.delta_h,
+ m.pedido_id, p.estado_pedido AS impacto_en_pedido
+ FROM movimiento_inventario m
+ JOIN inventario_tienda it ON it.inventario_id = m.inventario_id
+ LEFT JOIN pedido p ON p.pedido_id = m.pedido_id
+ {where_sql}
+ ORDER BY m.registrado_epoch ASC
+ """,
+ params,
+ ).fetchall()
+ incidencias = conn.execute(
+ "SELECT * FROM incidencia_inventario ORDER BY registrada_epoch DESC
+LIMIT 20"
+ ).fetchall()
+ pedido_detalle = None
+ if pedido_id:
+ p = conn.execute("SELECT * FROM pedido WHERE pedido_id = ?",
+(pedido_id,)).fetchone()
+ if p:
+ pedido_detalle = {
+ "pedido": dict(p),
+ "lineas": [dict(r) for r in conn.execute("SELECT * FROM
+linea_pedido WHERE pedido_id = ?", (pedido_id,)).fetchall()],
+ "reembolsos": [dict(r) for r in conn.execute("SELECT * FROM
+obligacion_reembolso WHERE pedido_id = ?", (pedido_id,)).fetchall()],
+ }
+ return {
+ "total_movimientos": len(movimientos),
+ "movimientos_auditables": [dict(m) for m in movimientos],
+ "incidencias_inventario": [dict(i) for i in incidencias],
+ "detalle_pedido": pedido_detalle,
+ }
+ finally:
+ conn.close()
