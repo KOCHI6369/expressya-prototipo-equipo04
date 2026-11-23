@@ -13,6 +13,12 @@ from app.services import (
     procesar_webhook_pasarela_simulada,
     reconstruir_saldo_auditable,
 )
+from app.services_c3 import (
+    consultar_historial_auditoria,
+    procesar_surtido_parcial,
+    registrar_discrepancia_picking,
+    registrar_reembolso_parcial_idempotente,
+)
 
 STATIC_INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
@@ -83,6 +89,42 @@ def dispatch_request(method: str, path_with_query: str, headers: dict, body_byte
                 procesados = procesar_outbox_pendientes_conn(conn, _now(0.0))
                 return 200, {"status": "RECUPERADO", "eventos_outbox_procesados": procesados}, "application/json"
 
+        if method == "POST" and path == "/api/v1/picking/discrepancia":
+            resp = registrar_discrepancia_picking(
+                dark_store_id=body.get("dark_store_id", "DS-NORTE"),
+                sku_id=body["sku_id"],
+                conteo_fisico=int(body["conteo_fisico"]),
+                picker_id=body.get("picker_id", "PICKER-01"),
+                motivo=body.get("motivo", "Discrepancia detectada en anaquel (AT-07)"),
+            )
+            return 200, resp, "application/json"
+
+        if method == "POST" and path == "/api/v1/picking/surtido-parcial":
+            resp = procesar_surtido_parcial(
+                pedido_id=body["pedido_id"],
+                skus_faltantes=body.get("skus_faltantes", []),
+                picker_id=body.get("picker_id", "PICKER-01"),
+                motivo_faltante=body.get("motivo_faltante", "FALTANTE_FISICO_EN_PICKING"),
+            )
+            return 200, resp, "application/json"
+
+        if method == "POST" and path == "/api/v1/payments/reembolso-parcial":
+            resp = registrar_reembolso_parcial_idempotente(
+                pedido_id=body["pedido_id"],
+                sku_id=body["sku_id"],
+                monto=float(body["monto"]),
+                motivo=body.get("motivo", "FALTANTE_FISICO_EN_PICKING"),
+            )
+            return 200, resp, "application/json"
+
+        if method == "GET" and path == "/api/v1/auditoria/historial":
+            resp = consultar_historial_auditoria(
+                dark_store_id=query.get("dark_store_id", [None])[0],
+                sku_id=query.get("sku_id", [None])[0],
+                pedido_id=query.get("pedido_id", [None])[0],
+            )
+            return 200, resp, "application/json"
+
         if method == "GET" and path == "/api/v1/admin/estado-sistema":
             conn = get_connection()
             try:
@@ -91,6 +133,7 @@ def dispatch_request(method: str, path_with_query: str, headers: dict, body_byte
                     "reservas": [dict(r) for r in conn.execute("SELECT * FROM reserva_inventario ORDER BY creada_epoch DESC LIMIT 20").fetchall()],
                     "pagos": [dict(r) for r in conn.execute("SELECT * FROM transaccion_pago ORDER BY creada_epoch DESC LIMIT 20").fetchall()],
                     "reembolsos": [dict(r) for r in conn.execute("SELECT * FROM obligacion_reembolso ORDER BY creado_epoch DESC LIMIT 20").fetchall()],
+                    "incidencias": [dict(r) for r in conn.execute("SELECT * FROM incidencia_inventario ORDER BY registrada_epoch DESC LIMIT 20").fetchall()],
                     "evento_outbox": [dict(r) for r in conn.execute("SELECT * FROM evento_outbox ORDER BY creado_epoch DESC LIMIT 20").fetchall()],
                     "evento_consumido": [dict(r) for r in conn.execute("SELECT * FROM evento_consumido ORDER BY procesado_epoch DESC LIMIT 20").fetchall()],
                 }, "application/json"
@@ -130,7 +173,7 @@ def run_server(port: int = 8000):
     init_and_seed_db(reset=False)
     server = ThreadingHTTPServer(("0.0.0.0", port), ExpressYaRequestHandler)
     print("======================================================================")
-    print(f" Servidor ExpressYa (Hitos C1 y C2) activo en: http://localhost:{port}")
+    print(f" Servidor ExpressYa (Hitos C1–C4) activo en: http://localhost:{port}")
     print(" Presiona Ctrl+C para detener el servidor.")
     print("======================================================================")
     server.serve_forever()
@@ -138,4 +181,3 @@ def run_server(port: int = 8000):
 
 if __name__ == "__main__":
     run_server(8000)
-    
