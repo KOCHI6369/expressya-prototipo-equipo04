@@ -312,8 +312,8 @@ async function probarAT09ReembolsoRepetido() {
 }
 
 async function verHistorialAuditoria() {
-  const qs = ultimoPedidoParcialId ? ?pedido_id=${encodeURIComponent(ultimoPedidoParcialId)} : "";
-  const res = await fetch(/api/v1/auditoria/historial${qs});
+  const qs = ultimoPedidoParcialId ? `?pedido_id=${encodeURIComponent(ultimoPedidoParcialId)}` : "";
+  const res = await fetch(`/api/v1/auditoria/historial${qs}`);
   const data = await res.json();
   log("C3: Historial Completo de Auditoría", data);
 }
