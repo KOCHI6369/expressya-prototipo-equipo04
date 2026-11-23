@@ -56,6 +56,10 @@
       <button onclick="probarAT06()">AT-06: Timeout Bancario (Resultado Incierto)</button><br/>
       <button class="danger" onclick="probarAT10Caida()">AT-10 (Paso 1): Provocar Caída tras COMMIT (Outbox PENDIENTE)</button>
       <button class="success" onclick="probarAT10Recuperar()">AT-10 (Paso 2): Ejecutar Worker de Recuperación Outbox</button>
+      <button class="warning" onclick="probarAT07Discrepancia()">AT-07: Discrepancia 10 vs 8 en Jugo (Bloquea SKU)</button><br>
+      <button class="success" onclick="probarAT08SurtidoParcial()">AT-08: Pedido 5 Líneas con 1 Faltante (4 Continúan)</button><br>
+      <button class="warning" onclick="probarAT09ReembolsoRepetido()">AT-09: Repetir Reembolso Parcial x2 (Idempotencia)</button><br>
+      <button onclick="verHistorialAuditoria()">C3: Ver Historial Completo de Auditoría</button><br> 
       <h3 style="margin-top:14px;">Resultado de la Operación / Log Reproducible:</h3>
       <pre id="log-salida">Listo para ejecutar escenarios...</pre>
     </div>
@@ -239,7 +243,80 @@
       log("AT-10 (Paso 2): Outbox Recuperado y Aplicado sin Duplicados", rRec);
       await refrescarTodo();
     }
+let ultimoPedidoParcialId = null;
 
+async function probarAT07Discrepancia() {
+  const res = await fetch("/api/v1/picking/discrepancia", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dark_store_id: "DS-NORTE",
+      sku_id: "SKU-JUGO-03",
+      conteo_fisico: 8,
+      picker_id: "PICKER-01",
+      motivo: "Discrepancia detectada en anaquel (AT-07)"
+    })
+  });
+  const data = await res.json();
+  log("AT-07: Discrepancia 10 vs 8 en Jugo", data);
+  if (typeof refrescarTodo === "function") await refrescarTodo();
+}
+
+async function probarAT08SurtidoParcial() {
+  const pedidoId = ultimoPedidoParcialId || prompt("Ingresa el pedido_id pagado para probar AT-08:", "");
+  if (!pedidoId) return;
+
+  const res = await fetch("/api/v1/picking/surtido-parcial", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      pedido_id: pedidoId,
+      skus_faltantes: ["SKU-JUGO-03"],
+      picker_id: "PICKER-01",
+      motivo_faltante: "FALTANTE_FISICO_EN_PICKING"
+    })
+  });
+  const data = await res.json();
+  ultimoPedidoParcialId = data.pedido_id || pedidoId;
+  log("AT-08: Surtido Parcial (5 líneas, 1 faltante)", data);
+  if (typeof refrescarTodo === "function") await refrescarTodo();
+}
+
+async function probarAT09ReembolsoRepetido() {
+  const pedidoId = ultimoPedidoParcialId || prompt("Ingresa el pedido_id parcial para probar AT-09:", "");
+  if (!pedidoId) return;
+
+  const payload = {
+    pedido_id: pedidoId,
+    sku_id: "SKU-JUGO-03",
+    monto: 32.0,
+    motivo: "FALTANTE_FISICO_EN_PICKING"
+  };
+
+  const r1 = await fetch("/api/v1/payments/reembolso-parcial", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const d1 = await r1.json();
+
+  const r2 = await fetch("/api/v1/payments/reembolso-parcial", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const d2 = await r2.json();
+
+  log("AT-09: Reembolso Parcial Repetido x2", { intento_1: d1, intento_2: d2 });
+  if (typeof refrescarTodo === "function") await refrescarTodo();
+}
+
+async function verHistorialAuditoria() {
+  const qs = ultimoPedidoParcialId ? ?pedido_id=${encodeURIComponent(ultimoPedidoParcialId)} : "";
+  const res = await fetch(/api/v1/auditoria/historial${qs});
+  const data = await res.json();
+  log("C3: Historial Completo de Auditoría", data);
+}
     cargarTiendas();
     cargarEstadoBD();
   </script>
